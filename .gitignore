@@ -20,3 +20,5 @@ resource/
 *.db
 *.zip
 sqlite-amalgamation-*/
+venv/
+downloads/
