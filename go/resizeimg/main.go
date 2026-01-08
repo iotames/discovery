@@ -50,7 +50,7 @@ func main() {
 	r.GET("/resizeimg", handleResizeImage)
 
 	// 确保必要目录存在
-	dirs := []string{"./thumbnails", "./downimgs", "./cache"}
+	dirs := []string{"./thumbnails", "./downimgs"}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			fmt.Printf("创建目录 %s 失败: %v\n", dir, err)
@@ -138,7 +138,10 @@ func handleResizeImage(c *gin.Context) {
 	hash := sha256.Sum256(imageData)
 	hashStr := hex.EncodeToString(hash[:])
 	ext := getExtension(format, imgURI)
-	fileName := hashStr + ext
+
+	// 重要修改：在文件名中加入尺寸信息，确保不同尺寸有不同文件名
+	// 格式：原图hash_宽度.扩展名
+	fileName := fmt.Sprintf("%s_%d%s", hashStr, width, ext)
 	thumbnailPath := filepath.Join("./thumbnails", fileName)
 
 	// 检查缩略图是否已存在
@@ -161,8 +164,10 @@ func handleResizeImage(c *gin.Context) {
 					"width":  existingImg.Bounds().Dx(),
 					"height": existingImg.Bounds().Dy(),
 				},
-				"format":     strings.ToLower(existingFormat),
-				"image_data": base64Str,
+				"requested_size": width,
+				"actual_size":    existingImg.Bounds().Dx(),
+				"format":         strings.ToLower(existingFormat),
+				"image_data":     base64Str,
 			})
 			return
 		}
@@ -210,11 +215,13 @@ func handleResizeImage(c *gin.Context) {
 			"width":  resizedImg.Bounds().Dx(),
 			"height": resizedImg.Bounds().Dy(),
 		},
-		"filename":   fileName,
-		"sha256":     hashStr,
-		"format":     strings.ToLower(format),
-		"message":    "缩放成功",
-		"image_data": base64Str,
+		"requested_size": width,
+		"actual_size":    resizedImg.Bounds().Dx(),
+		"filename":       fileName,
+		"sha256":         hashStr,
+		"format":         strings.ToLower(format),
+		"message":        "缩放成功",
+		"image_data":     base64Str,
 	})
 }
 
