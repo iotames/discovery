@@ -6,19 +6,35 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
 )
 
-var httpClient = &http.Client{
-	Timeout: 30 * time.Second,
-	Transport: &http.Transport{
+func getHttpClient() *http.Client {
+	transport := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 10,
 		IdleConnTimeout:     30 * time.Second,
-	},
+	}
+	if Proxy != "" {
+		// 设置代理URL
+		proxyURL, err := url.Parse(Proxy)
+		if err != nil {
+			log.Fatal("Failed to parse proxy URL:", err)
+		}
+
+		// 自定义 http.Transport
+		transport.Proxy = http.ProxyURL(proxyURL)
+		log.Println("Using proxy:", proxyURL.String())
+	}
+	return &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: transport,
+	}
 }
 
 // 下载网络图片
@@ -47,7 +63,7 @@ func downloadImage(url string) (image.Image, string, []byte, error) {
 		"Accept-Encoding":           {"gzip, deflate, br, zstd"},
 	}
 
-	resp, err := httpClient.Do(req)
+	resp, err := getHttpClient().Do(req)
 	if err != nil {
 		return nil, "", nil, fmt.Errorf("网络请求失败: %v", err)
 	}

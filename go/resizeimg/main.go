@@ -12,11 +12,18 @@ import (
 	"github.com/iotames/easyserver/httpsvr"
 )
 
+var (
+	BuildTime string
+	Version   = "v0.0.2"
+)
+
 var WebPort int
+var Proxy string
 
 func init() {
 	cf := easyconf.NewConf()
 	cf.IntVar(&WebPort, "WEB_PORT", 8081, "web服务端口")
+	cf.StringVar(&Proxy, "PROXY", "", "代理地址")
 	cf.Parse(true)
 }
 
