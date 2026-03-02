@@ -6,7 +6,7 @@ require (
 	github.com/google/gopacket v1.1.19
 	github.com/iotames/easyconf v1.2.0
 	github.com/iotames/easydb v0.3.0
-	github.com/iotames/easyserver v1.2.0
+	github.com/iotames/easyserver v1.3.0
 	github.com/lib/pq v1.10.9
 	github.com/shirou/gopsutil/v3 v3.24.5
 	github.com/sqweek/dialog v0.0.0-20240226140203-065105509627
