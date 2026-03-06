@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"encoding/json"
 	"sync"
 )
 
@@ -67,6 +69,13 @@ func (s ScriptDir) OkNormalFile(d string) error {
 // 优先从dirList目录列表中查找文件。如找不到，最后从内嵌文件中读取。
 func (s ScriptDir) GetScriptText(fpath string) (stxt string, err error) {
 	var b []byte
+	b, err = s.GetScriptBytes(fpath)
+	return string(b), err
+}
+
+// GetScriptBytes 获取脚本文件的纯文本内容，返回字节
+// 优先从dirList目录列表中查找文件。如找不到，最后从内嵌文件中读取。
+func (s ScriptDir) GetScriptBytes(fpath string) (b []byte, err error) {
 	var filepaths []string
 	for _, d := range s.dirList {
 		filepaths = append(filepaths, filepath.Join(d, fpath))
@@ -75,19 +84,17 @@ func (s ScriptDir) GetScriptText(fpath string) (stxt string, err error) {
 	if realfpath != "" {
 		// 找到目标文件
 		b, err = os.ReadFile(realfpath)
-		stxt = string(b)
 	}
-	if stxt != "" && err == nil {
+	if len(b) != 0 && err == nil {
 		// 文件内容不为空，读取没有错误
-		return stxt, err
+		return b, err
 	}
 	// 找不到文件，或者虽然找到文件，但文件内容为空或读取错误。则从内嵌的文件中读取sql文件
 	b, err = s.embedFS.ReadFile(fpath)
 	if err != nil {
-		return stxt, err
+		return b, err
 	}
-	stxt = string(b)
-	return stxt, err
+	return b, err
 }
 
 // GetFirstExistFile 从给定的多个文件种，获取第一个存在的文件。
@@ -98,6 +105,15 @@ func (s ScriptDir) GetFirstExistFile(filelist ...string) string {
 		}
 	}
 	return ""
+}
+
+// DecodeJson 解码json文件。
+func (s ScriptDir) DecodeJson(fpath string, v any) error {
+	b, err := s.GetScriptBytes(fpath)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, v)
 }
 
 // GetSQL 获取sql文本
