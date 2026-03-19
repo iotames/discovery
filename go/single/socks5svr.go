@@ -2,21 +2,43 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
+	"strings"
+	"time"
+)
+
+// SOCKS5 协议常量
+const (
+	socks5Version = 0x05
+
+	// 命令
+	cmdConnect = 0x01 // CONNECT 命令
+
+	// 地址类型
+	atypIPv4   = 0x01 // IPv4 地址
+	atypDomain = 0x03 // 域名
+
+	// 响应码
+	repSuccess                 = 0x00 // 成功
+	repConnectionRefused       = 0x05 // 连接被拒绝
+	repCommandNotSupported     = 0x07 // 不支持的命令
+	repAddressTypeNotSupported = 0x08 // 不支持的地址类型
+
+	// 认证方法
+	authNoAuth = 0x00 // 无认证
 )
 
 func main() {
-	// 监听所有接口的1080端口（SOCKS5标准端口）
 	listener, err := net.Listen("tcp", ":1080")
 	if err != nil {
 		fmt.Printf("监听失败: %v\n", err)
 		return
 	}
 	defer listener.Close()
-	fmt.Println("SOCKS5代理服务器启动，监听 :1080")
+	fmt.Println("SOCKS5 代理服务器启动，监听 :1080")
 
 	for {
 		conn, err := listener.Accept()
@@ -28,371 +50,237 @@ func main() {
 	}
 }
 
-// handleClient 处理单个SOCKS5客户端连接
+// handleClient 处理单个客户端连接
 func handleClient(client net.Conn) {
 	defer client.Close()
 
-	// 1. 认证协商阶段（RFC 1928 Section 3）
+	// 设置读取超时，防止恶意连接长时间占用
+	client.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	// 1. 认证协商（仅支持无认证）
 	if !handleAuth(client) {
 		return
 	}
 
-	// 2. 处理请求（RFC 1928 Section 4）
+	// 清除读取超时，后续转发不设限
+	client.SetReadDeadline(time.Time{})
+
+	// 2. 处理请求（仅支持 CONNECT）
 	handleRequest(client)
 }
 
-// handleAuth 处理认证协商
+// handleAuth 处理客户端认证协商（仅支持无认证）
+// 返回 true 表示认证成功，false 表示失败
 func handleAuth(client net.Conn) bool {
-	// 读取客户端认证方法请求
-	// 格式: [VER(1), NMETHODS(1), METHODS(1-255)]
-	buf := make([]byte, 2)
-	_, err := io.ReadFull(client, buf)
-	if err != nil {
+	// 读取版本号和客户端支持的认证方法数量
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(client, header); err != nil {
+		fmt.Printf("读取认证头失败: %v\n", err)
 		return false
 	}
 
-	ver, nmethods := buf[0], buf[1]
-	if ver != 0x05 {
-		fmt.Printf("不支持的SOCKS版本: %d\n", ver)
+	ver, nmethods := header[0], header[1]
+	if ver != socks5Version {
+		fmt.Printf("不支持的 SOCKS 版本: %d\n", ver)
 		return false
 	}
 
-	// 读取客户端支持的所有认证方法
+	// 读取客户端支持的认证方法列表
 	methods := make([]byte, nmethods)
-	_, err = io.ReadFull(client, methods)
-	if err != nil {
+	if _, err := io.ReadFull(client, methods); err != nil {
+		fmt.Printf("读取认证方法列表失败: %v\n", err)
 		return false
 	}
 
-	// 检查是否支持无认证方法 (0x00)
-	supportNoAuth := false
-	for _, method := range methods {
-		if method == 0x00 {
-			supportNoAuth = true
-			break
+	// 检查客户端是否支持无认证 (0x00)
+	for _, m := range methods {
+		if m == authNoAuth {
+			// 回复服务器选择无认证
+			response := []byte{socks5Version, authNoAuth}
+			if _, err := client.Write(response); err != nil {
+				fmt.Printf("发送认证响应失败: %v\n", err)
+				return false
+			}
+			return true
 		}
 	}
 
-	if !supportNoAuth {
-		// 回复客户端不支持任何认证方法 (0xFF)
-		client.Write([]byte{0x05, 0xFF})
-		return false
-	}
-
-	// 选择无认证方法 (0x00)
-	client.Write([]byte{0x05, 0x00})
-	return true
+	// 没有共同的认证方法，回复拒绝
+	response := []byte{socks5Version, 0xFF}
+	client.Write(response)
+	fmt.Println("客户端没有提供支持的认证方法")
+	return false
 }
 
-// handleRequest 处理客户端请求
+// handleRequest 解析客户端请求并执行 CONNECT 转发
 func handleRequest(client net.Conn) {
-	// 读取请求头
-	// 格式: [VER(1), CMD(1), RSV(1), ATYP(1)]
+	// 读取请求头（固定 4 字节）
 	header := make([]byte, 4)
-	_, err := io.ReadFull(client, header)
-	if err != nil {
+	if _, err := io.ReadFull(client, header); err != nil {
+		fmt.Printf("读取请求头失败: %v\n", err)
 		return
 	}
 
 	ver, cmd, _, atyp := header[0], header[1], header[2], header[3]
-	if ver != 0x05 {
+	if ver != socks5Version {
+		fmt.Printf("请求中的 SOCKS 版本错误: %d\n", ver)
 		return
 	}
 
-	// 根据ATYP解析目标地址
+	// 仅支持 CONNECT 命令
+	if cmd != cmdConnect {
+		sendReply(client, repCommandNotSupported)
+		fmt.Printf("不支持的命令: 0x%02x\n", cmd)
+		return
+	}
+
+	// 解析目标地址（仅支持 IPv4 和域名）
 	targetAddr, err := parseAddress(client, atyp)
 	if err != nil {
-		sendReply(client, 0x08) // ADDR_TYPE_NOT_SUPPORTED
+		fmt.Printf("解析地址失败: %v\n", err)
+		sendReply(client, repAddressTypeNotSupported)
 		return
 	}
 
-	// 根据命令类型处理
-	switch cmd {
-	case 0x01: // CONNECT (TCP连接)
-		log.Println("-----使用TCP连接---CONNECT")
-		handleConnect(client, targetAddr)
-	case 0x03: // UDP ASSOCIATE
-		log.Println("-----使用UDP连接----ASSOCIATE")
-		handleUDPAssociate(client, targetAddr)
-	default:
-		// 不支持的命令
-		sendReply(client, 0x07) // CMD_NOT_SUPPORTED
+	// 连接目标服务器
+	target, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+	if err != nil {
+		fmt.Printf("连接目标 %s 失败: %v\n", targetAddr, err)
+		sendReply(client, repConnectionRefused)
+		return
 	}
+	defer target.Close()
+
+	// 构建成功响应，BND.ADDR 和 BND.PORT 使用代理连接目标时使用的本地地址
+	localAddr := target.LocalAddr().(*net.TCPAddr)
+	// 响应格式: VER, REP, RSV, ATYP, BND.ADDR, BND.PORT
+	// 固定使用 IPv4 类型 (0x01)，长度 10 字节
+	reply := make([]byte, 10)
+	reply[0] = socks5Version
+	reply[1] = repSuccess
+	reply[2] = 0x00 // RSV
+	reply[3] = atypIPv4
+	copy(reply[4:8], localAddr.IP.To4())                            // 4 字节 IPv4 地址
+	binary.BigEndian.PutUint16(reply[8:10], uint16(localAddr.Port)) // 2 字节端口
+
+	if _, err := client.Write(reply); err != nil {
+		fmt.Printf("发送成功响应失败: %v\n", err)
+		return
+	}
+
+	// 双向数据转发，任意一方关闭连接即结束
+	done := make(chan struct{}, 2)
+	go func() {
+		_, err := io.Copy(target, client)
+		if err != nil && !isNormalConnectionClose(err) {
+			fmt.Printf("客户端->目标转发异常错误: %v\n", err)
+		}
+		done <- struct{}{}
+	}()
+	go func() {
+		_, err := io.Copy(client, target)
+		if err != nil && !isNormalConnectionClose(err) {
+			fmt.Printf("目标->客户端转发异常错误: %v\n", err)
+		}
+		done <- struct{}{}
+	}()
+
+	// 等待任意一个转发方向结束（通常是客户端或目标关闭连接）
+	<-done
+	// 另一个方向会因连接关闭而自动退出
 }
 
-// parseAddress 根据ATYP解析目标地址 (RFC 1928 Section 5)
+// parseAddress 根据 ATYP 解析目标地址和端口
+// 支持 IPv4 (0x01) 和 域名 (0x03)
+// 返回 "host:port" 格式的字符串
 func parseAddress(client net.Conn, atyp byte) (string, error) {
 	switch atyp {
-	case 0x01: // IPv4地址
+	case atypIPv4:
+		// 读取 4 字节 IPv4 地址
 		addr := make([]byte, 4)
-		_, err := io.ReadFull(client, addr)
-		if err != nil {
-			return "", err
+		if _, err := io.ReadFull(client, addr); err != nil {
+			return "", fmt.Errorf("读取 IPv4 地址失败: %w", err)
 		}
-		// 读取端口号 (2字节，大端序)
+		// 读取 2 字节端口
 		port := make([]byte, 2)
-		_, err = io.ReadFull(client, port)
-		if err != nil {
-			return "", err
+		if _, err := io.ReadFull(client, port); err != nil {
+			return "", fmt.Errorf("读取端口失败: %w", err)
 		}
-		portNum := binary.BigEndian.Uint16(port)
-		return fmt.Sprintf("%s:%d", net.IP(addr).String(), portNum), nil
+		ip := net.IP(addr).String()
+		return fmt.Sprintf("%s:%d", ip, binary.BigEndian.Uint16(port)), nil
 
-	case 0x03: // 域名
-		// 先读取域名长度
+	case atypDomain:
+		// 读取域名长度（1 字节）
 		lenByte := make([]byte, 1)
-		_, err := io.ReadFull(client, lenByte)
-		if err != nil {
-			return "", err
+		if _, err := io.ReadFull(client, lenByte); err != nil {
+			return "", fmt.Errorf("读取域名长度失败: %w", err)
 		}
 		domainLen := int(lenByte[0])
 
 		// 读取域名
 		domain := make([]byte, domainLen)
-		_, err = io.ReadFull(client, domain)
-		if err != nil {
-			return "", err
+		if _, err := io.ReadFull(client, domain); err != nil {
+			return "", fmt.Errorf("读取域名失败: %w", err)
 		}
 
-		// 读取端口号
+		// 读取端口
 		port := make([]byte, 2)
-		_, err = io.ReadFull(client, port)
-		if err != nil {
-			return "", err
+		if _, err := io.ReadFull(client, port); err != nil {
+			return "", fmt.Errorf("读取端口失败: %w", err)
 		}
-		portNum := binary.BigEndian.Uint16(port)
-		return fmt.Sprintf("%s:%d", string(domain), portNum), nil
+		return fmt.Sprintf("%s:%d", string(domain), binary.BigEndian.Uint16(port)), nil
 
 	default:
-		// 不支持的地址类型
-		// 需要丢弃剩余的数据
-		if atyp == 0x04 { // IPv6
-			// 跳过IPv6地址 (16字节) + 端口 (2字节)
-			discardBuf := make([]byte, 18)
-			client.Read(discardBuf)
-		}
+		// 不支持 IPv6 (0x04) 和其他类型
 		return "", fmt.Errorf("不支持的地址类型: 0x%02x", atyp)
 	}
 }
 
-// sendReply 发送SOCKS5响应 (RFC 1928 Section 6)
+// sendReply 发送 SOCKS5 响应（简化版，绑定地址固定为 0.0.0.0:0）
+// 用于发送错误响应
 func sendReply(client net.Conn, rep byte) {
-	// 响应格式: [VER(1), REP(1), RSV(1), ATYP(1), BND.ADDR, BND.PORT]
-	// 这里简化处理，使用0.0.0.0:0作为绑定地址
-	reply := []byte{0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
-	client.Write(reply)
+	// 响应格式：VER, REP, RSV, ATYP, BND.ADDR, BND.PORT
+	// 使用 IPv4 0.0.0.0:0 作为绑定地址（对于错误响应无意义）
+	reply := []byte{socks5Version, rep, 0x00, atypIPv4, 0, 0, 0, 0, 0, 0}
+	if _, err := client.Write(reply); err != nil {
+		fmt.Printf("发送错误响应失败: %v\n", err)
+	}
 }
 
-// handleConnect 处理CONNECT命令
-func handleConnect(client net.Conn, targetAddr string) {
-	// 尝试连接目标服务器
-	target, err := net.Dial("tcp", targetAddr)
-	if err != nil {
-		fmt.Printf("连接目标服务器失败 %s: %v\n", targetAddr, err)
-		sendReply(client, 0x05) // CONNECTION_REFUSED
-		return
+// isClosedConnError 判断错误是否为连接关闭的常见错误
+// 用于在转发中忽略正常的关闭错误
+func isClosedConnError(err error) bool {
+	if err == nil {
+		return false
 	}
-	defer target.Close()
-
-	// 发送成功响应
-	// 获取本地连接地址作为BND.ADDR
-	localAddr := target.LocalAddr().(*net.TCPAddr)
-	reply := make([]byte, 10)
-	reply[0] = 0x05 // VER
-	reply[1] = 0x00 // REP (成功)
-	reply[2] = 0x00 // RSV
-	reply[3] = 0x01 // ATYP (IPv4)
-	copy(reply[4:8], localAddr.IP.To4())
-	binary.BigEndian.PutUint16(reply[8:10], uint16(localAddr.Port))
-	client.Write(reply)
-
-	// 双向数据转发
-	done := make(chan struct{}, 2)
-
-	go func() {
-		io.Copy(target, client)
-		done <- struct{}{}
-	}()
-
-	go func() {
-		io.Copy(client, target)
-		done <- struct{}{}
-	}()
-
-	// 等待任意一方关闭连接
-	<-done
+	if err == io.EOF {
+		return true
+	}
+	// 网络错误，如 "use of closed network connection"
+	if opErr, ok := err.(*net.OpError); ok {
+		return opErr.Err.Error() == "use of closed network connection"
+	}
+	return false
 }
 
-// handleUDPAssociate 处理UDP ASSOCIATE命令 (RFC 1928 Section 7)
-func handleUDPAssociate(client net.Conn, targetAddr string) {
-	// UDP ASSOCIATE命令中，客户端发送的目标地址通常为0.0.0.0:0
-	// 但我们需要返回代理服务器监听的UDP地址和端口
-
-	// 创建UDP Socket
-	udpConn, err := net.ListenUDP("udp", nil)
-	if err != nil {
-		sendReply(client, 0x01) // GENERAL_FAILURE
-		return
+// isNormalConnectionClose 判断错误是否属于连接正常关闭（可忽略）
+// 包括：io.EOF, net.ErrClosed, 以及包含 "use of closed network connection" 的错误
+func isNormalConnectionClose(err error) bool {
+	if err == nil {
+		return false
 	}
-	defer udpConn.Close()
-
-	// 获取UDP监听的地址
-	udpAddr := udpConn.LocalAddr().(*net.UDPAddr)
-
-	// 发送响应，包含UDP监听的地址和端口
-	reply := make([]byte, 10)
-	reply[0] = 0x05 // VER
-	reply[1] = 0x00 // REP (成功)
-	reply[2] = 0x00 // RSV
-	reply[3] = 0x01 // ATYP (IPv4)
-	copy(reply[4:8], udpAddr.IP.To4())
-	binary.BigEndian.PutUint16(reply[8:10], uint16(udpAddr.Port))
-	client.Write(reply)
-
-	fmt.Printf("UDP关联已建立，监听UDP: %s\n", udpAddr.String())
-
-	// 处理UDP数据转发
-	handleUDPForwarding(udpConn, client, targetAddr)
-}
-
-// handleUDPForwarding 处理UDP数据转发
-func handleUDPForwarding(udpConn *net.UDPConn, tcpClient net.Conn, targetAddr string) {
-	// 存储客户端地址映射（简化实现，只处理单个客户端）
-	var clientAddr *net.UDPAddr
-
-	// 处理从客户端UDP连接接收的数据
-	go func() {
-		buf := make([]byte, 65535)
-		for {
-			n, addr, err := udpConn.ReadFromUDP(buf)
-			if err != nil {
-				return
-			}
-
-			// 记录客户端地址
-			clientAddr = addr
-
-			// 解析UDP数据包 (RFC 1928 Section 7)
-			// 格式: [RSV(2), FRAG(1), ATYP(1), DST.ADDR, DST.PORT, DATA...]
-			if n < 4 { // 至少需要RSV(2)+FRAG(1)+ATYP(1)
-				continue
-			}
-
-			rsv1, rsv2, frag, atyp := buf[0], buf[1], buf[2], buf[3]
-			if rsv1 != 0 || rsv2 != 0 {
-				continue
-			}
-
-			// 这里简化处理，只处理frag=0的数据包
-			if frag != 0 {
-				continue
-			}
-
-			// 解析目标地址和端口
-			offset := 4
-			var destAddr string
-
-			switch atyp {
-			case 0x01: // IPv4
-				if n < offset+4+2 {
-					continue
-				}
-				ip := net.IP(buf[offset : offset+4])
-				offset += 4
-				port := binary.BigEndian.Uint16(buf[offset : offset+2])
-				offset += 2
-				destAddr = fmt.Sprintf("%s:%d", ip.String(), port)
-
-			case 0x03: // 域名
-				if n < offset+1 {
-					continue
-				}
-				domainLen := int(buf[offset])
-				offset++
-				if n < offset+domainLen+2 {
-					continue
-				}
-				domain := string(buf[offset : offset+domainLen])
-				offset += domainLen
-				port := binary.BigEndian.Uint16(buf[offset : offset+2])
-				offset += 2
-				destAddr = fmt.Sprintf("%s:%d", domain, port)
-
-			default:
-				// 不支持的地址类型
-				continue
-			}
-
-			// 剩余的数据
-			data := buf[offset:n]
-
-			// 转发到目标服务器
-			targetUDPAddr, err := net.ResolveUDPAddr("udp", destAddr)
-			if err != nil {
-				continue
-			}
-
-			udpConn.WriteToUDP(data, targetUDPAddr)
-		}
-	}()
-
-	// 处理从目标服务器返回的数据
-	go func() {
-		buf := make([]byte, 65535)
-		for {
-			if clientAddr == nil {
-				continue
-			}
-
-			// 这里简化实现：假设我们知道目标地址
-			// 实际应该为每个目标地址维护一个映射
-			targetUDPAddr, err := net.ResolveUDPAddr("udp", targetAddr)
-			if err != nil {
-				continue
-			}
-
-			// 创建一个UDP客户端连接到目标服务器
-			targetConn, err := net.DialUDP("udp", nil, targetUDPAddr)
-			if err != nil {
-				continue
-			}
-			defer targetConn.Close()
-
-			// 监听返回的数据
-			n, err := targetConn.Read(buf)
-			if err != nil {
-				continue
-			}
-
-			// 将数据封装为SOCKS5 UDP数据包格式
-			packet := make([]byte, n+10) // 10字节头部
-			// RSV = 0x0000
-			packet[0] = 0x00
-			packet[1] = 0x00
-			// FRAG = 0x00
-			packet[2] = 0x00
-			// ATYP = 0x01 (IPv4)
-			packet[3] = 0x01
-			// 目标地址 (这里简化使用原始目标地址)
-			copy(packet[4:8], targetUDPAddr.IP.To4())
-			binary.BigEndian.PutUint16(packet[8:10], uint16(targetUDPAddr.Port))
-			// 数据
-			copy(packet[10:], buf[:n])
-
-			// 发送回客户端
-			if clientAddr != nil {
-				udpConn.WriteToUDP(packet, clientAddr)
-			}
-		}
-	}()
-
-	// 保持TCP连接活跃（UDP ASSOCIATE需要保持TCP控制连接）
-	// 这里简化处理，等待TCP连接关闭
-	buf := make([]byte, 1)
-	for {
-		_, err := tcpClient.Read(buf)
-		if err != nil {
-			break
-		}
+	// 直接匹配常见错误
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return true
 	}
+	// 某些情况下错误可能被包装，需要递归检查
+	// 同时检查错误字符串，因为旧版 Go 可能没有 net.ErrClosed
+	if strings.Contains(err.Error(), "use of closed network connection") {
+		return true
+	}
+	// 尝试解包并递归检查
+	if unwrappable, ok := err.(interface{ Unwrap() error }); ok {
+		return isNormalConnectionClose(unwrappable.Unwrap())
+	}
+	return false
 }
