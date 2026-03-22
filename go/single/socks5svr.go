@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"strings"
 	"time"
@@ -29,6 +30,12 @@ const (
 
 	// 认证方法
 	authNoAuth = 0x00 // 无认证
+
+	// SOCKS4 协议常量
+	socks4Version          = 0x04
+	socks4ResponseGranted  = 0x5A // 请求成功
+	socks4ResponseRejected = 0x5B // 请求失败或拒绝
+
 )
 
 func main() {
@@ -57,14 +64,38 @@ func handleClient(client net.Conn) {
 	// 设置读取超时，防止恶意连接长时间占用
 	client.SetReadDeadline(time.Now().Add(30 * time.Second))
 
+	// 协议探测：仅窥探第一个字节（版本号）
+	versionByte := make([]byte, 1)
+	if _, err := io.ReadFull(client, versionByte); err != nil {
+		fmt.Printf("读取版本号失败: %v\n", err)
+		return
+	}
+
+	// 协议路由分发
+	switch versionByte[0] {
+	case socks5Version:
+		// 路由到完整的SOCKS5处理管道。需要放回版本字节，供后续认证协商使用
+		log.Println("-----SOCKS5 处理管道-----")
+		handleSOCKS5Client(&connWithFirstByte{Conn: client, firstByte: versionByte})
+	case socks4Version:
+		// 路由到完整的SOCKS4处理管道。版本字节已消耗，直接使用原始连接
+		log.Println("-----SOCKS4 处理管道-----")
+		handleSOCKS4Client(client)
+	default:
+		fmt.Printf("不支持的 SOCKS 版本: %d\n", versionByte[0])
+		// 发送一个简单的 SOCKS4 格式拒绝响应
+		client.Write([]byte{0x00, socks4ResponseRejected, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+	}
+}
+
+// handleSOCKS5Client 处理SOCKS5客户端的完整生命周期
+func handleSOCKS5Client(client net.Conn) {
 	// 1. 认证协商（仅支持无认证）
 	if !handleAuth(client) {
 		return
 	}
-
 	// 清除读取超时，后续转发不设限
 	client.SetReadDeadline(time.Time{})
-
 	// 2. 处理请求（仅支持 CONNECT）
 	handleRequest(client)
 }
@@ -80,6 +111,7 @@ func handleAuth(client net.Conn) bool {
 	}
 
 	ver, nmethods := header[0], header[1]
+	log.Println("-----SOCKS 版本--", ver, "-----方法数量--", nmethods)
 	if ver != socks5Version {
 		fmt.Printf("不支持的 SOCKS 版本: %d\n", ver)
 		return false
@@ -171,6 +203,7 @@ func handleRequest(client net.Conn) {
 	// 双向数据转发，任意一方关闭连接即结束
 	done := make(chan struct{}, 2)
 	go func() {
+		log.Println("------io.Copy(target, client)--------")
 		_, err := io.Copy(target, client)
 		if err != nil && !isNormalConnectionClose(err) {
 			fmt.Printf("客户端->目标转发异常错误: %v\n", err)
@@ -178,6 +211,7 @@ func handleRequest(client net.Conn) {
 		done <- struct{}{}
 	}()
 	go func() {
+		log.Println("------io.Copy(client, target)-------")
 		_, err := io.Copy(client, target)
 		if err != nil && !isNormalConnectionClose(err) {
 			fmt.Printf("目标->客户端转发异常错误: %v\n", err)
@@ -283,4 +317,117 @@ func isNormalConnectionClose(err error) bool {
 		return isNormalConnectionClose(unwrappable.Unwrap())
 	}
 	return false
+}
+
+// connWithFirstByte 是一个辅助类型，用于将已读出的第一个字节“放回”数据流开头
+// 确保原有的 handleAuth 能读取到完整的 [VER, NMETHODS] 开头
+type connWithFirstByte struct {
+	net.Conn
+	firstByte []byte
+	read      bool
+}
+
+func (c *connWithFirstByte) Read(b []byte) (n int, err error) {
+	if !c.read && len(c.firstByte) > 0 {
+		// 首次读取，返回预先读出的版本字节
+		b[0] = c.firstByte[0]
+		c.read = true
+		return 1, nil
+	}
+	// 后续读取直接使用原始连接
+	return c.Conn.Read(b)
+}
+
+/////////////////// 实现独立且结构清晰的SOCKS4处理管道
+
+// handleSOCKS4Client 处理SOCKS4客户端的完整生命周期
+func handleSOCKS4Client(client net.Conn) {
+	// SOCKS4 无认证阶段，直接进入请求处理
+	client.SetReadDeadline(time.Time{})
+	handleSOCKS4Request(client)
+}
+
+// handleSOCKS4Request 是SOCKS4的“请求处理”阶段，对应SOCKS5的handleRequest
+func handleSOCKS4Request(client net.Conn) {
+	// 1. 解析请求
+	targetAddr, command, err := parseSOCKS4Request(client)
+	if err != nil {
+		fmt.Printf("解析SOCKS4请求失败: %v\n", err)
+		sendSOCKS4Reply(client, socks4ResponseRejected)
+		return
+	}
+
+	// 2. 验证命令 (复用常量 cmdConnect)
+	if command != cmdConnect {
+		fmt.Printf("SOCKS4 不支持的命令: 0x%02x\n", command)
+		sendSOCKS4Reply(client, socks4ResponseRejected)
+		return
+	}
+
+	// 3. 连接目标
+	target, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+	if err != nil {
+		fmt.Printf("连接目标 %s 失败: %v\n", targetAddr, err)
+		sendSOCKS4Reply(client, socks4ResponseRejected)
+		return
+	}
+	defer target.Close()
+
+	// 4. 发送成功响应
+	sendSOCKS4Reply(client, socks4ResponseGranted)
+
+	// 5. 数据转发 (完全复用您原有的优雅模式)
+	forwardConnection(client, target)
+}
+
+// parseSOCKS4Request 解析SOCKS4请求，返回目标地址和命令
+func parseSOCKS4Request(client net.Conn) (targetAddr string, command byte, err error) {
+	// TODO Windows系统代理常使用 SOCKS4a（支持域名解析）。
+	header := make([]byte, 7) // CD(1) + DSTPORT(2) + DSTIP(4)
+	if _, err := io.ReadFull(client, header); err != nil {
+		return "", 0, fmt.Errorf("读取请求头失败: %w", err)
+	}
+	command = header[0]
+	dstPort := binary.BigEndian.Uint16(header[1:3])
+	dstIP := net.IPv4(header[3], header[4], header[5], header[6])
+
+	// 读取并丢弃USERID
+	for {
+		b := make([]byte, 1)
+		if _, err := io.ReadFull(client, b); err != nil {
+			return "", 0, fmt.Errorf("读取USERID失败: %w", err)
+		}
+		if b[0] == 0x00 {
+			break
+		}
+	}
+	return fmt.Sprintf("%s:%d", dstIP.String(), dstPort), command, nil
+}
+
+// sendSOCKS4Reply 发送SOCKS4响应
+func sendSOCKS4Reply(client net.Conn, rep byte) {
+	reply := []byte{0x00, rep, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	client.Write(reply)
+}
+
+///////////// 抽象通用的数据转发函数
+
+// forwardConnection 通用的连接双向转发，复用 isNormalConnectionClose 错误处理
+func forwardConnection(a, b net.Conn) {
+	done := make(chan struct{}, 2)
+	go func() {
+		_, err := io.Copy(b, a)
+		if err != nil && !isNormalConnectionClose(err) {
+			fmt.Printf("连接转发异常 (a->b): %v\n", err)
+		}
+		done <- struct{}{}
+	}()
+	go func() {
+		_, err := io.Copy(a, b)
+		if err != nil && !isNormalConnectionClose(err) {
+			fmt.Printf("连接转发异常 (b->a): %v\n", err)
+		}
+		done <- struct{}{}
+	}()
+	<-done
 }
